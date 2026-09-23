@@ -1,12 +1,63 @@
 # NOTES
 
-Commands used to build `finland.pmtiles`, generate `style.json`, and deploy
-both to Hetzner Object Storage for tuulikartta.info's basemap.
+Commands used to build/extract the basemap `.pmtiles`, generate `style.json`,
+and deploy both to Hetzner Object Storage for tuulikartta.info's basemap.
 
 Bucket/endpoint used throughout: `tuulikartta-tiles` @ `https://hel1.your-objectstorage.com`
 (rclone remote `hetzner`, aws-cli profile `hetzner`, both already configured on this machine).
 
-## 1. Build finland.pmtiles (tiles/)
+**Currently deployed:** `nordic-baltic.pmtiles` (mainland Iceland, Norway,
+Sweden, Finland, Denmark, Estonia, Latvia, Lithuania — no Greenland, Faroe
+Islands, or Svalbard — z0-12), built via extraction (§0). The original
+`finland.pmtiles` (Finland only, z0-15, built from scratch with Planetiler,
+§1) is superseded but left in place below as a documented alternative if
+per-country full-detail builds are ever needed again.
+
+## 0. Extract a region from Protomaps' public planet build (current approach)
+
+Rather than reprocessing raw OpenStreetMap data yourself, `pmtiles extract`
+can pull just a bounding box out of Protomaps' daily public planet-wide
+build over HTTP range requests — no local Planetiler run, no 30+GB OSM
+source download, no hours-long build. Trade-off: you get Protomaps' schema/
+cadence as-is (which is what this project's style already targets anyway)
+and whatever max zoom you choose, rather than fully custom processing.
+
+Install the CLI:
+
+```bash
+brew install pmtiles
+```
+
+Extract (bbox is `min_lon,min_lat,max_lon,max_lat`; `--maxzoom` controls
+both file size and how much has to be downloaded — each extra zoom level
+roughly quadruples the number of tiles in a fixed region):
+
+```bash
+cd ~/Git/tuulikartta/basemaps/tiles/data
+pmtiles extract https://latest.protomaps.com/v4.pmtiles nordic-baltic.pmtiles \
+  --bbox=-25,53.5,29,71.5 --maxzoom=12
+```
+
+That bbox covers mainland Iceland through the North Cape and south to
+Lithuania. Result: 1.5GB, ~5.5 minutes, 107 HTTP requests, 171k tiles — vs.
+730MB source / ~5GB scratch disk / hours for the Finland-only Planetiler
+build in §1 below, for 8 countries instead of 1 (at z12 instead of z15 —
+no building-level detail, but full place/road labels and city-level detail).
+
+Sanity-check before committing to a bigger extract: run a quick low-zoom
+test first (`--maxzoom=6` finishes in seconds) to confirm the bbox/URL are
+right, then scale up.
+
+```bash
+ls -lh nordic-baltic.pmtiles
+xxd -l 16 nordic-baltic.pmtiles   # should start with "PMTiles", not zeros
+```
+
+Then generate/update `style.json`'s source url to point at wherever it's
+uploaded (§2-3 below) — everything past this point is identical regardless
+of whether the `.pmtiles` came from extraction or a from-scratch build.
+
+## 1. Alternative: build finland.pmtiles from scratch with Planetiler (tiles/)
 
 Clean out any previous build state first — a partially-finished build leaves
 a corrupt `.pmtiles` (starts with zero bytes instead of the `PMTiles` magic
@@ -89,7 +140,7 @@ docker system prune -a --volumes
 ```bash
 cd ~/Git/tuulikartta/basemaps/styles
 npm ci
-npm run generate_style style.json "pmtiles://https://tuulikartta-tiles.hel1.your-objectstorage.com/finland.pmtiles" light fi
+npm run generate_style style.json "pmtiles://https://tuulikartta-tiles.hel1.your-objectstorage.com/nordic-baltic.pmtiles" light fi
 ```
 
 Positional args: output path, tile source URL (a `pmtiles://` URL works
@@ -110,7 +161,7 @@ at the real bucket, not a placeholder/demo URL.
 ```bash
 cd ~/Git/tuulikartta/basemaps
 
-rclone copyto tiles/data/finland.pmtiles hetzner:tuulikartta-tiles/finland.pmtiles \
+rclone copyto tiles/data/nordic-baltic.pmtiles hetzner:tuulikartta-tiles/nordic-baltic.pmtiles \
   --s3-acl public-read \
   --header-upload "Content-Type: application/octet-stream" \
   --header-upload "Cache-Control: public, max-age=3600" \
@@ -122,6 +173,9 @@ rclone copyto style.json hetzner:tuulikartta-tiles/style.json \
   --header-upload "Cache-Control: public, max-age=3600" \
   --progress
 ```
+
+(Substitute whatever `.pmtiles` filename you actually built/extracted —
+`finland.pmtiles`, `nordic-baltic.pmtiles`, etc.)
 
 `--s3-acl public-read` is required for both — the bucket policy only grants
 public read under the `basemap/*` prefix (left over from an earlier,
@@ -135,9 +189,9 @@ need their own public-read ACL to be fetchable.
 curl -sD - -o /dev/null -H "Origin: https://tuulikartta.info" \
   https://tuulikartta-tiles.hel1.your-objectstorage.com/style.json
 
-# finland.pmtiles supports range requests (required for PMTiles reads)
+# the .pmtiles file supports range requests (required for PMTiles reads)
 curl -sD - -o /dev/null -H "Range: bytes=0-15" \
-  https://tuulikartta-tiles.hel1.your-objectstorage.com/finland.pmtiles
+  https://tuulikartta-tiles.hel1.your-objectstorage.com/nordic-baltic.pmtiles
 
 # current bucket CORS / public-read policy
 aws s3api get-bucket-cors --profile hetzner --endpoint-url https://hel1.your-objectstorage.com --bucket tuulikartta-tiles
@@ -146,8 +200,19 @@ aws s3api get-bucket-policy --profile hetzner --endpoint-url https://hel1.your-o
 
 ## Sizing reference
 
-Planetiler's own rule of thumb (confirmed against this Finland build):
-**disk ≈ 1GB + 5-10× the `.osm.pbf` size**, **RAM ≈ 0.5× the `.osm.pbf` size**
-minimum (in practice give the JVM heap more — see `-Xmx4g` above). Finland's
-extract is 730MB, giving a scratch-disk need of roughly 4.5-8GB; the finished
-`finland.pmtiles` came out to 1.7GB.
+**Extraction (§0):** cost scales with region area × zoom, not with running
+a build — no meaningful RAM/scratch-disk requirement, just network + the
+output file size. Datapoints from this project: Nordic+Baltic bbox above
+at maxzoom=6 → 10MB/6s; at maxzoom=12 → 1.5GB/5.5min. The whole planet at
+z0-15 is documented at ~120GB, "each additional zoom level roughly doubles
+the size" — so budget accordingly before jumping straight to z15 on a large
+region; test at a low maxzoom first.
+
+**From-scratch Planetiler build (§1):** rule of thumb (confirmed against
+the Finland build): **disk ≈ 1GB + 5-10× the `.osm.pbf` size**, **RAM ≈
+0.5× the `.osm.pbf` size** minimum (in practice give the JVM heap more —
+see `-Xmx4g` above). Finland's extract is 730MB (→ ~4.5-8GB scratch disk,
+1.7GB finished file at z15). For scale, Europe's Geofabrik extract alone is
+~33GB, implying ~165-330GB of scratch disk — impractical on a laptop with
+limited free space, which is exactly why §0's extraction approach is used
+for anything larger than one country.
